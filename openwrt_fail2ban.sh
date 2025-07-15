@@ -279,17 +279,25 @@ showList() {
 
 checkExpired() {
     log_message "INFO" "Checking for expired blocks..."
-    BLOCKED=$(iptables -L INPUT -n | grep "^DROP" | awk '{print $4}' | grep -v '0.0.0.0/0')
+    # Get list of currently blocked IPs from iptables
+    # Look for DROP rules and extract the source IP
+    BLOCKED=$(iptables -L INPUT -n | grep "^DROP" | grep "0.0.0.0/0" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0/0") print $i}')
     local expired_count=0
     
     for blocked_ip in $BLOCKED; do
+        # Skip if not a valid IP
+        isip "$blocked_ip"
+        if [ $ISIP -eq 0 ]; then
+            continue
+        fi
+        
+        # Find this IP in our tracking log
         for i in `grep ":$blocked_ip:" $IPLIST_LOG 2>/dev/null`; do
             IP=`echo $i | cut -d':' -f2`
-            isip $IP
             COUNT=`echo $i | cut -d':' -f3`
             LASTACTION=`echo $i | cut -d':' -f4`
             
-            if [ $((NOW-LASTACTION)) -gt $BLOCKSECS ] && [ ! "$IP" == "" ] && [ $ISIP -eq 1 ] && [ $COUNT -lt $PERMBAN ]; then
+            if [ $((NOW-LASTACTION)) -gt $BLOCKSECS ] && [ ! "$IP" == "" ] && [ $COUNT -lt $PERMBAN ]; then
                 LINE=`iptables -L INPUT -n --line-numbers | grep "$IP" | head -1 | cut -d' ' -f1`
                 if [ ! "$LINE" == "" ]; then
                     local block_duration=$((NOW-LASTACTION))
@@ -313,8 +321,8 @@ checkExpired() {
 show_status() {
     print_section "Current System Status"
     
-    # Count current blocks
-    local current_blocks=$(iptables -L INPUT -n | grep "^DROP" | grep -v "0.0.0.0/0" | wc -l)
+    # Count current blocks - look for DROP rules with 0.0.0.0/0 destination (our rules)
+    local current_blocks=$(iptables -L INPUT -n | grep "^DROP" | grep "0.0.0.0/0" | wc -l)
     local tracking_ips=$([ -f "$IPLIST_LOG" ] && wc -l < "$IPLIST_LOG" || echo 0)
     local total_bans=$([ -f "$BANNED_LOG" ] && grep ":BLOCKED" "$BANNED_LOG" | wc -l || echo 0)
     
@@ -325,9 +333,14 @@ show_status() {
     if [ $current_blocks -gt 0 ]; then
         printf "\n"
         printf "${BOLD}${RED}Currently Blocked IPs:${NC}\n"
-        iptables -L INPUT -n --line-numbers | grep DROP | grep -v "0.0.0.0/0" | while read line; do
-            local ip=$(echo "$line" | awk '{print $5}')
-            printf "  ${WHITE}%-15s${NC}\n" "$ip"
+        # Extract IPs from DROP rules
+        iptables -L INPUT -n --line-numbers | grep DROP | grep "0.0.0.0/0" | while read line; do
+            # Extract the IP address (not 0.0.0.0/0) from the line
+            local ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0/0") print $i}' | head -1)
+            local rule_num=$(echo "$line" | awk '{print $1}')
+            if [ ! -z "$ip" ]; then
+                printf "  ${WHITE}%-15s${NC} (rule %s)\n" "$ip" "$rule_num"
+            fi
         done
     fi
     
@@ -507,7 +520,8 @@ main() {
         
         if [ "$BLOCKED_NOW" != "" ] || [ "$EXPIRED_BLOCK" != "" ]; then
             print_section "Current iptables DROP Rules"
-            iptables -L INPUT -n --line-numbers | grep DROP | grep -v "0.0.0.0/0" | while read line; do
+            # Show our DROP rules (with 0.0.0.0/0 destination)
+            iptables -L INPUT -n --line-numbers | grep DROP | grep "0.0.0.0/0" | while read line; do
                 printf "  ${CYAN}%s${NC}\n" "$line"
             done
         fi
