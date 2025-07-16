@@ -359,17 +359,26 @@ show_status() {
 cleanup_files() {
     log_message "INFO" "Performing file cleanup..."
     
-    # CLEANUP - KEEP ONLY RECENT DATA AND LIMIT FILE SIZES
-    echo -n "" > ${IPLIST_LOG}.new
-    IFS="
-"
-    # Keep only last 3 days of data to prevent unbounded growth
-    for i in `grep -E "^$(date +%Y%m%d):|^$(date -d '1 day ago' +%Y%m%d):|^$(date -d '2 days ago' +%Y%m%d):" $IPLIST_LOG 2>/dev/null`; do
-        if [ ! "$i" == "" ]; then
-            echo $i >> ${IPLIST_LOG}.new
-        fi
-    done
-    mv ${IPLIST_LOG}.new $IPLIST_LOG
+    # CLEANUP - KEEP ONLY RECENT DATA AND REMOVE DUPLICATES
+    if [ -f $IPLIST_LOG ]; then
+        # Get entries from last 3 days and remove duplicates (keep most recent per IP)
+        grep -E "^$(date +%Y%m%d):|^$(date -d '1 day ago' +%Y%m%d):|^$(date -d '2 days ago' +%Y%m%d):" $IPLIST_LOG 2>/dev/null | \
+        awk -F: '{
+            # For each IP, keep only the entry with the highest timestamp
+            key = $2;  # IP address
+            if (key != "" && ($4 > max_time[key] || max_time[key] == "")) {
+                max_time[key] = $4;
+                entry[key] = $0;
+            }
+        }
+        END {
+            for (ip in entry) {
+                print entry[ip];
+            }
+        }' | sort > ${IPLIST_LOG}.new
+        
+        mv ${IPLIST_LOG}.new $IPLIST_LOG
+    fi
     
     # Rotate banned.log if it gets too large (>100KB)
     if [ -f $BANNED_LOG ] && [ $(stat -c%s $BANNED_LOG 2>/dev/null || echo 0) -gt 102400 ]; then
@@ -442,6 +451,19 @@ process_logs() {
         if [ "$LASTCOUNT" == "" ]; then
             LASTCOUNT=0
         fi
+        
+        # Handle circular buffer reset - if current count < stored count, 
+        # the log buffer has rotated and old entries are gone
+        if [ $COUNT -lt $LASTCOUNT ]; then
+            log_message "DEBUG" "Circular buffer reset detected for $IP ($COUNT < $LASTCOUNT) - resetting counter"
+            LASTCOUNT=0
+            # Remove any old entries for this IP and add new one
+            grep -v ":$IP:" $IPLIST_LOG > ${IPLIST_LOG}.tmp 2>/dev/null || touch ${IPLIST_LOG}.tmp
+            echo "$DATE:$IP:$COUNT:$NOW" >> ${IPLIST_LOG}.tmp
+            mv ${IPLIST_LOG}.tmp $IPLIST_LOG
+            ELAPSED=0  # Reset elapsed time since we're starting fresh
+        fi
+        
         NEWCOUNT=$((COUNT-LASTCOUNT))
         
         # Add new IPs to tracking
