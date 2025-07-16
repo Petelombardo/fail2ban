@@ -77,6 +77,7 @@ ${BOLD}OPTIONS:${NC}
     -q, --quiet     Quiet mode (minimal output)
     -s, --status    Show current status only
     -u, --unblock   Unblock expired IPs and exit
+    -r, --remove    Remove specific IP from blocks (use with IP address)
     -c, --config    Show current configuration
     --color         Force color output (if terminal doesn't auto-detect)
     --no-color      Disable color output
@@ -93,14 +94,16 @@ ${BOLD}FILES:${NC}
     Ban history:        ${BANNED_LOG}
 
 ${BOLD}EXAMPLES:${NC}
-    $SCRIPT_NAME                # Run fail2ban check
-    $SCRIPT_NAME -v             # Run with verbose output
-    $SCRIPT_NAME -s             # Show status only
-    $SCRIPT_NAME -u             # Unblock expired IPs
-    $SCRIPT_NAME --color        # Force colors if not detected
+    $SCRIPT_NAME                        # Run fail2ban check
+    $SCRIPT_NAME -v                     # Run with verbose output
+    $SCRIPT_NAME -s                     # Show status only
+    $SCRIPT_NAME -u                     # Unblock expired IPs
+    $SCRIPT_NAME -r 45.148.10.215       # Manually unblock specific IP
+    $SCRIPT_NAME --color                # Force colors if not detected
 
 ${BOLD}NOTE:${NC}
     If colors appear as escape codes, use --no-color option.
+    IPs with >${PERMBAN} attempts are permanently banned and require manual removal.
 
 EOF
 }
@@ -280,9 +283,9 @@ showList() {
 checkExpired() {
     log_message "INFO" "Checking for expired blocks..."
     # Get list of currently blocked IPs from iptables
-    # Look for DROP rules and extract the source IP
     BLOCKED=$(iptables -L INPUT -n | grep "^DROP" | grep "0.0.0.0/0" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0/0") print $i}')
     local expired_count=0
+    local orphaned_count=0
     
     for blocked_ip in $BLOCKED; do
         # Skip if not a valid IP
@@ -291,11 +294,25 @@ checkExpired() {
             continue
         fi
         
-        # Find this IP in our tracking log
-        for i in `grep ":$blocked_ip:" $IPLIST_LOG 2>/dev/null`; do
-            IP=`echo $i | cut -d':' -f2`
-            COUNT=`echo $i | cut -d':' -f3`
-            LASTACTION=`echo $i | cut -d':' -f4`
+        # Check if this IP exists in our tracking log
+        tracking_entry=$(grep ":$blocked_ip:" $IPLIST_LOG 2>/dev/null | tail -1)
+        
+        if [ -z "$tracking_entry" ]; then
+            # Orphaned block - IP is blocked but not in tracking log
+            # This happens when logs/tracking get cleaned up but iptables rule remains
+            LINE=`iptables -L INPUT -n --line-numbers | grep "$blocked_ip" | head -1 | cut -d' ' -f1`
+            if [ ! "$LINE" == "" ]; then
+                log_message "WARN" "Removing orphaned block for $blocked_ip (no tracking record found)"
+                echo "$(date):$blocked_ip:UNBLOCKED:ORPHANED" >> $BANNED_LOG
+                EXPIRED_BLOCK+=",$blocked_ip"
+                iptables -D INPUT $LINE
+                orphaned_count=$((orphaned_count + 1))
+            fi
+        else
+            # Normal expiration check for tracked IPs
+            IP=`echo $tracking_entry | cut -d':' -f2`
+            COUNT=`echo $tracking_entry | cut -d':' -f3`
+            LASTACTION=`echo $tracking_entry | cut -d':' -f4`
             
             if [ $((NOW-LASTACTION)) -gt $BLOCKSECS ] && [ ! "$IP" == "" ] && [ $COUNT -lt $PERMBAN ]; then
                 LINE=`iptables -L INPUT -n --line-numbers | grep "$IP" | head -1 | cut -d' ' -f1`
@@ -308,13 +325,14 @@ checkExpired() {
                     expired_count=$((expired_count + 1))
                 fi
             fi
-        done
+        fi
     done
     
-    if [ $expired_count -eq 0 ]; then
-        log_message "INFO" "No expired blocks found"
+    if [ $expired_count -eq 0 ] && [ $orphaned_count -eq 0 ]; then
+        log_message "INFO" "No expired or orphaned blocks found"
     else
-        log_message "SUCCESS" "Unblocked $expired_count expired IPs"
+        [ $expired_count -gt 0 ] && log_message "SUCCESS" "Unblocked $expired_count expired IPs"
+        [ $orphaned_count -gt 0 ] && log_message "SUCCESS" "Removed $orphaned_count orphaned blocks"
     fi
 }
 
@@ -333,15 +351,32 @@ show_status() {
     if [ $current_blocks -gt 0 ]; then
         printf "\n"
         printf "${BOLD}${RED}Currently Blocked IPs:${NC}\n"
-        # Extract IPs from DROP rules
+        # Extract IPs from DROP rules and check their status
         iptables -L INPUT -n --line-numbers | grep DROP | grep "0.0.0.0/0" | while read line; do
             # Extract the IP address (not 0.0.0.0/0) from the line
             local ip=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i != "0.0.0.0/0") print $i}' | head -1)
             local rule_num=$(echo "$line" | awk '{print $1}')
             if [ ! -z "$ip" ]; then
-                printf "  ${WHITE}%-15s${NC} (rule %s)\n" "$ip" "$rule_num"
+                # Check if this is a permanent ban
+                local tracking_entry=$(grep ":$ip:" $IPLIST_LOG 2>/dev/null | tail -1)
+                if [ ! -z "$tracking_entry" ]; then
+                    local count=$(echo "$tracking_entry" | cut -d':' -f3)
+                    local timestamp=$(echo "$tracking_entry" | cut -d':' -f4)
+                    local age_seconds=$((NOW - timestamp))
+                    local age_hours=$((age_seconds / 3600))
+                    
+                    if [ $count -ge $PERMBAN ]; then
+                        printf "  ${WHITE}%-15s${NC} (rule %s) ${RED}PERMANENT${NC} (%d attempts)\n" "$ip" "$rule_num" "$count"
+                    else
+                        printf "  ${WHITE}%-15s${NC} (rule %s) %dh old (%d attempts)\n" "$ip" "$rule_num" "$age_hours" "$count"
+                    fi
+                else
+                    printf "  ${WHITE}%-15s${NC} (rule %s) ${YELLOW}ORPHANED${NC}\n" "$ip" "$rule_num"
+                fi
             fi
         done
+        
+        printf "\n${YELLOW}Note: Use '${SCRIPT_NAME} -r <IP>' to manually remove permanent/orphaned blocks${NC}\n"
     fi
     
     # Show recent activity
@@ -558,6 +593,7 @@ main() {
 }
 
 # Parse command line arguments
+REMOVE_IP=""
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -581,6 +617,15 @@ while [ $# -gt 0 ]; do
             [ ! -f $IPLIST_LOG ] && touch $IPLIST_LOG
             checkExpired
             exit 0
+            ;;
+        -r|--remove)
+            if [ -z "$2" ]; then
+                printf "${RED}Error: -r/--remove requires an IP address${NC}\n" >&2
+                printf "Example: %s -r 192.168.1.100${NC}\n" "$SCRIPT_NAME" >&2
+                exit 1
+            fi
+            REMOVE_IP="$2"
+            shift 2
             ;;
         -c|--config)
             show_config
@@ -623,6 +668,42 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Handle manual IP removal
+if [ ! -z "$REMOVE_IP" ]; then
+    print_header "Manually Removing IP: $REMOVE_IP"
+    
+    # Validate IP format
+    isip "$REMOVE_IP"
+    if [ $ISIP -eq 0 ]; then
+        log_message "ERROR" "Invalid IP address format: $REMOVE_IP"
+        exit 1
+    fi
+    
+    # Check if IP is currently blocked
+    if iptables -L INPUT -n | grep -q "$REMOVE_IP"; then
+        LINE=`iptables -L INPUT -n --line-numbers | grep "$REMOVE_IP" | head -1 | cut -d' ' -f1`
+        if [ ! -z "$LINE" ]; then
+            iptables -D INPUT $LINE
+            log_message "SUCCESS" "Removed iptables rule for $REMOVE_IP"
+            echo "$(date):$REMOVE_IP:UNBLOCKED:MANUAL" >> $BANNED_LOG
+        fi
+    else
+        log_message "WARN" "IP $REMOVE_IP is not currently blocked in iptables"
+    fi
+    
+    # Remove from tracking log
+    if grep -q ":$REMOVE_IP:" $IPLIST_LOG 2>/dev/null; then
+        grep -v ":$REMOVE_IP:" $IPLIST_LOG > ${IPLIST_LOG}.tmp
+        mv ${IPLIST_LOG}.tmp $IPLIST_LOG
+        log_message "SUCCESS" "Removed $REMOVE_IP from tracking log"
+    else
+        log_message "WARN" "IP $REMOVE_IP was not found in tracking log"
+    fi
+    
+    log_message "SUCCESS" "Manual removal of $REMOVE_IP completed"
+    exit 0
+fi
 
 # Run main function
 main
